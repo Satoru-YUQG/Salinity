@@ -1,73 +1,105 @@
-"""Streamlit widgets for algorithm hyperparameters."""
+"""Streamlit widgets for hyperparameter grid search."""
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import json
+from typing import Dict, List
 
 import streamlit as st
 
-from algo_params import ParamSpec, default_params, get_param_schema
+from algo_params import default_params, get_param_schema
+from param_presets import (
+    _format_default,
+    build_param_grid,
+    count_grid_combinations,
+)
+from param_presets import ParamPreset
 
 
-def render_hyperparameters(algorithm: str, key_prefix: str = "") -> Dict[str, Any]:
-    """Render controls for one algorithm; return param dict."""
-    params = default_params(algorithm)
-    st.caption(f"Hyperparameters for **{algorithm}**")
+def _ensure_grid_store(algorithm: str) -> None:
+    if "param_grid_store" not in st.session_state:
+        st.session_state.param_grid_store = {}
+    if algorithm not in st.session_state.param_grid_store:
+        defaults = default_params(algorithm)
+        st.session_state.param_grid_store[algorithm] = {
+            spec.name: _format_default(spec, defaults[spec.name])
+            for spec in get_param_schema(algorithm)
+        }
+
+
+def render_param_grid(algorithm: str) -> List[ParamPreset]:
+    """
+    One text field per hyperparameter. Enter comma-separated values to sweep.
+    All combinations are tested on Run (e.g. 300,200 × 10,8 → 4 configs).
+    """
+    _ensure_grid_store(algorithm)
+    grid_text: Dict[str, str] = st.session_state.param_grid_store[algorithm]
+
+    st.markdown(
+        "Enter **comma-separated values** per parameter. "
+        "The run will test **every combination** and rank results."
+    )
+    st.caption("Examples: `300,200,150,50` for trees · `10,8,5` for max depth · `0` = unlimited depth")
+
+    toolbar = st.columns([1, 1, 2])
+    with toolbar[0]:
+        if st.button("↺ Reset to defaults", key=f"grid_reset_{algorithm}"):
+            defaults = default_params(algorithm)
+            st.session_state.param_grid_store[algorithm] = {
+                spec.name: _format_default(spec, defaults[spec.name])
+                for spec in get_param_schema(algorithm)
+            }
+            st.rerun()
+    with toolbar[1]:
+        uploaded = st.file_uploader(
+            "Load grid JSON",
+            type=["json"],
+            key=f"grid_upload_{algorithm}",
+        )
+        if uploaded is not None:
+            loaded = json.loads(uploaded.getvalue())
+            if isinstance(loaded, dict):
+                st.session_state.param_grid_store[algorithm].update(loaded)
+                st.rerun()
 
     for spec in get_param_schema(algorithm):
-        widget_key = f"{key_prefix}{algorithm}_{spec.name}"
-        params[spec.name] = _render_one(spec, widget_key, params[spec.name])
+        help_parts = []
+        if spec.kind == "choice" and spec.choices:
+            help_parts.append(f"Options: {', '.join(map(str, spec.choices))}")
+        if spec.kind == "optional_int":
+            help_parts.append("Use 0 for unlimited depth")
+        if spec.kind == "bool":
+            help_parts.append("Use true,false")
 
-    return params
-
-
-def _render_one(spec: ParamSpec, key: str, default: Any) -> Any:
-    if spec.kind == "int":
-        return st.number_input(
+        grid_text[spec.name] = st.text_input(
             spec.label,
-            min_value=int(spec.minimum),
-            max_value=int(spec.maximum),
-            value=int(default),
-            step=int(spec.step or 1),
-            help=spec.help_text or None,
-            key=key,
+            value=grid_text.get(spec.name, _format_default(spec, spec.default)),
+            help=" · ".join(help_parts) if help_parts else "Single value or comma-separated list",
+            key=f"grid_{algorithm}_{spec.name}",
         )
 
-    if spec.kind == "optional_int":
-        return st.number_input(
-            spec.label,
-            min_value=int(spec.minimum),
-            max_value=int(spec.maximum),
-            value=int(default),
-            step=int(spec.step or 1),
-            help=spec.help_text or "0 = unlimited depth",
-            key=key,
-        )
+    st.session_state.param_grid_store[algorithm] = grid_text
 
-    if spec.kind == "float":
-        return st.number_input(
-            spec.label,
-            min_value=float(spec.minimum),
-            max_value=float(spec.maximum),
-            value=float(default),
-            step=float(spec.step or 0.01),
-            format="%.6f" if (spec.maximum or 1) < 0.01 else "%.4f",
-            help=spec.help_text or None,
-            key=key,
-        )
+    try:
+        n_combos = count_grid_combinations(algorithm, grid_text)
+        presets = build_param_grid(algorithm, grid_text)
+    except ValueError as exc:
+        st.error(str(exc))
+        return []
 
-    if spec.kind == "bool":
-        return st.checkbox(spec.label, value=bool(default), key=key)
+    st.info(f"**{n_combos}** hyperparameter combination(s) will be tested (× your run count / CV folds).")
 
-    if spec.kind == "choice":
-        choices = spec.choices or []
-        idx = choices.index(default) if default in choices else 0
-        return st.selectbox(
-            spec.label,
-            options=choices,
-            index=idx,
-            help=spec.help_text or None,
-            key=key,
-        )
+    with st.expander("Preview combinations"):
+        for p in presets[:20]:
+            st.write(f"• {p.name}")
+        if len(presets) > 20:
+            st.caption(f"… and {len(presets) - 20} more")
 
-    return default
+    st.download_button(
+        "Download grid (JSON)",
+        data=json.dumps(grid_text, indent=2),
+        file_name=f"{algorithm}_grid.json",
+        mime="application/json",
+    )
+
+    return presets

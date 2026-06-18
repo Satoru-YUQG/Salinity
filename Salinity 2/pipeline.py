@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,10 +13,12 @@ from config import (
     DEFAULT_RUNS,
     DEFAULT_SALINITY_THRESHOLD,
     DEFAULT_TEST_SIZE,
+    TARGET_COLUMN,
 )
 from data import class_distribution, prepare_dataset
 from evaluate import MetricBundle, evaluate_model
 from models import get_model
+from param_presets import ParamPreset, format_params_short, rank_presets
 from threshold_search import find_best_threshold
 from train import train_model, transform_for_model
 
@@ -23,22 +26,27 @@ from train import train_model, transform_for_model
 @dataclass
 class RunConfig:
     data_path: Optional[str] = None
-    salinity_threshold: float = DEFAULT_SALINITY_THRESHOLD
+    target_columns: Sequence[str] = field(default_factory=lambda: [TARGET_COLUMN])
+    label_mode: str = "threshold"  # threshold | direct
+    class_threshold: float = DEFAULT_SALINITY_THRESHOLD
+    multi_target_combine: str = "any"  # any | all
     decision_threshold: float = DEFAULT_DECISION_THRESHOLD
     drop_columns: Sequence[str] = field(default_factory=list)
     use_columns: Optional[Sequence[str]] = None
     algorithm: str = "random_forest"
     model_params: Dict[str, Any] = field(default_factory=dict)
+    preset_name: Optional[str] = None
     sampling: str = "smote"
     smote_k_neighbors: Optional[int] = None
     normalize: bool = True
     n_runs: int = DEFAULT_RUNS
     test_size: float = DEFAULT_TEST_SIZE
     random_seed: Optional[int] = None
-    evaluation_mode: str = "holdout"  # holdout | stratified_cv
+    evaluation_mode: str = "holdout"
     cv_folds: int = 5
     auto_tune_threshold: bool = False
-    tune_metric: str = "recall"  # recall | f1
+    tune_metric: str = "recall"
+    rank_metric: str = "recall_mean"
 
 
 @dataclass
@@ -58,6 +66,18 @@ class ExperimentResult:
         return pd.DataFrame(rows)
 
 
+@dataclass
+class MultiPresetResult:
+    base_config: RunConfig
+    preset_results: List[Tuple[str, Dict[str, Any], ExperimentResult]]
+    comparison_rows: List[Dict[str, Any]]
+    best_preset_name: Optional[str]
+    rank_metric: str
+
+    def comparison_dataframe(self) -> pd.DataFrame:
+        return pd.DataFrame(self.comparison_rows)
+
+
 def _aggregate_metrics(metrics: List[MetricBundle]) -> Dict[str, float]:
     keys = ["accuracy", "balanced_accuracy", "recall", "precision", "f1"]
     out: Dict[str, float] = {}
@@ -75,19 +95,11 @@ def _aggregate_metrics(metrics: List[MetricBundle]) -> Dict[str, float]:
 def _safe_stratified_split(X, y, test_size, seed):
     try:
         return train_test_split(
-            X,
-            y,
-            test_size=test_size,
-            random_state=seed,
-            stratify=y,
+            X, y, test_size=test_size, random_state=seed, stratify=y,
         )
     except ValueError:
         return train_test_split(
-            X,
-            y,
-            test_size=test_size,
-            random_state=seed,
-            stratify=None,
+            X, y, test_size=test_size, random_state=seed, stratify=None,
         )
 
 
@@ -109,7 +121,7 @@ def _train_and_evaluate_fold(
     y_val,
     feature_names: List[str],
     seed: int,
-) -> tuple[MetricBundle, float, Optional[Dict[str, float]]]:
+) -> tuple:
     model = get_model(config.algorithm, random_state=seed, params=config.model_params)
     model = train_model(
         model,
@@ -126,9 +138,7 @@ def _train_and_evaluate_fold(
 
     if config.auto_tune_threshold and hasattr(model, "predict_proba"):
         proba = model.predict_proba(X_val_t)[:, 1]
-        threshold, _ = find_best_threshold(
-            y_val, proba, metric=config.tune_metric
-        )
+        threshold, _ = find_best_threshold(y_val, proba, metric=config.tune_metric)
 
     metrics = evaluate_model(model, X_val_t, y_val, decision_threshold=threshold)
     importance = _feature_importance(model, feature_names)
@@ -162,28 +172,35 @@ def _run_cv_once(config: RunConfig, X, y, feature_names, seed) -> List[tuple]:
     return results
 
 
-def run_experiment(
-    config: RunConfig,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> ExperimentResult:
-    X, y, _meta = prepare_dataset(
+def _load_xy(config: RunConfig):
+    return prepare_dataset(
         path=config.data_path,
-        salinity_threshold=config.salinity_threshold,
+        target_columns=list(config.target_columns),
+        label_mode=config.label_mode,
+        class_threshold=config.class_threshold,
+        multi_target_combine=config.multi_target_combine,
         drop_columns=config.drop_columns if not config.use_columns else None,
         use_columns=config.use_columns,
     )
 
+
+def run_experiment(
+    config: RunConfig,
+    progress_callback: Optional[Callable[..., None]] = None,
+) -> ExperimentResult:
+    X, y, _meta = _load_xy(config)
+
     if y.nunique() < 2:
         raise ValueError(
-            f"Only one class present at Ece threshold {config.salinity_threshold}. "
-            "Adjust the threshold or add more saline samples."
+            "Only one class present for the selected target/threshold. "
+            "Adjust the threshold, target column(s), or label mode."
         )
 
     minority = int(y.value_counts().min())
     if minority < 2 and config.n_runs > 1 and config.evaluation_mode == "holdout":
         raise ValueError(
             f"Only {minority} sample(s) in the minority class. "
-            "Lower the Ece threshold or add more saline profiles."
+            "Use stratified CV, lower the threshold, or add more positive samples."
         )
 
     feature_names = list(X.columns)
@@ -194,7 +211,7 @@ def run_experiment(
 
     for i in range(config.n_runs):
         if progress_callback:
-            progress_callback(i + 1, config.n_runs)
+            progress_callback(i + 1, config.n_runs, config.preset_name)
 
         seed = (
             int(rng.integers(0, 2**31 - 1))
@@ -241,6 +258,52 @@ def run_experiment(
         summary=summary,
         tuned_thresholds=tuned_thresholds,
         feature_importance=avg_importance,
+    )
+
+
+def run_multi_preset_experiment(
+    base_config: RunConfig,
+    presets: Sequence[ParamPreset],
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> MultiPresetResult:
+    """Run the same experiment for multiple hyperparameter presets and compare."""
+    if not presets:
+        raise ValueError("Select at least one hyperparameter preset to run.")
+
+    preset_results: List[Tuple[str, Dict[str, Any], ExperimentResult]] = []
+    comparison_rows: List[Dict[str, Any]] = []
+    total = len(presets) * base_config.n_runs
+    global_step = 0
+
+    for preset in presets:
+        cfg = copy.deepcopy(base_config)
+        cfg.model_params = dict(preset.params)
+        cfg.preset_name = preset.name
+
+        def _cb(run_i: int, run_n: int, pname: str = preset.name):
+            nonlocal global_step
+            global_step += 1
+            if progress_callback:
+                progress_callback(global_step, total, pname)
+
+        result = run_experiment(cfg, progress_callback=_cb)
+        preset_results.append((preset.name, preset.params, result))
+
+        row = {
+            "combo_name": preset.name,
+            "params_summary": format_params_short(base_config.algorithm, preset.params),
+            **{k: v for k, v in result.summary.items() if k.endswith("_mean")},
+        }
+        comparison_rows.append(row)
+
+    sorted_rows, best = rank_presets(comparison_rows, metric=base_config.rank_metric)
+
+    return MultiPresetResult(
+        base_config=base_config,
+        preset_results=preset_results,
+        comparison_rows=sorted_rows,
+        best_preset_name=best,
+        rank_metric=base_config.rank_metric,
     )
 
 

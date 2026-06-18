@@ -33,7 +33,7 @@ def main():
 
     config = RunConfig(
         data_path=args.data_path,
-        salinity_threshold=args.salinity_threshold,
+        class_threshold=args.salinity_threshold,
         decision_threshold=args.decision_threshold,
         drop_columns=args.drop,
         algorithm=args.algorithm,

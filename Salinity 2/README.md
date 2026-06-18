@@ -6,22 +6,56 @@ Everything runs from **this folder** (`Salinity 2`).
 
 | File | Purpose |
 |------|---------|
-| `Data.xlsx` | Your dataset (also in `data/Data.xlsx`) |
+| `Data.xlsx` | Your dataset (preferred location) |
 | `app.py` | Streamlit UI |
 | `Salinity_2.py` | Command-line experiments |
 | `run_ui.bat` | Double-click to open the UI |
 | `run_cli.bat` | Double-click for a CLI run |
+| `requirements.txt` | Python dependencies |
 
-## Setup (once)
+## Requirements
+
+- **Python**: 3.9+ (tested with 3.9)
+- **pip**: installed with Python
+
+## Install (once)
+
+From this folder:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
 ## Run
 
-- **UI:** double-click `run_ui.bat` or run `streamlit run app.py` from this folder.
-- **CLI:** double-click `run_cli.bat` or run `python Salinity_2.py --runs 30`.
+- **UI (recommended):** double-click `run_ui.bat`
+  - or:
+
+```bash
+python -m streamlit run app.py
+```
+
+- **CLI:** double-click `run_cli.bat`
+  - or:
+
+```bash
+python Salinity_2.py --runs 30 --algorithm random_forest
+```
+
+If `python` is not recognized in PowerShell, use the Windows launcher:
+
+```bash
+py -m pip install -r requirements.txt
+py -m streamlit run app.py
+py Salinity_2.py
+```
+
+## Data notes
+
+- The app creates the label from **`Ece mean`** using your chosen threshold.
+- The code automatically blocks ID/leakage columns from being used as features.
+- If you replace `Data.xlsx` with a new dataset, keep the same column names (or update `config.py`).
 
 ## UI tabs
 

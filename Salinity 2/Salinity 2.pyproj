@@ -26,6 +26,7 @@
     <Compile Include="data_loader.py" />
     <Compile Include="evaluate.py" />
     <Compile Include="models.py" />
+    <Compile Include="param_presets.py" />
     <Compile Include="pipeline.py" />
     <Compile Include="preprocessing.py" />
     <Compile Include="sampling.py" />

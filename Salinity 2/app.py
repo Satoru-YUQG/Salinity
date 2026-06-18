@@ -12,14 +12,16 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from algo_params import default_params
 from config import (
+    BEST_RESULT_TITLES,
     DEFAULT_DECISION_THRESHOLD,
     DEFAULT_RUNS,
     DEFAULT_SALINITY_THRESHOLD,
     DEFAULT_TEST_SIZE,
-    LEAKAGE_COLUMNS,
+    LABEL_MODES,
+    MULTI_TARGET_COMBINE,
     PROJECT_ROOT,
+    RANK_METRICS,
     SAMPLING_CHOICES,
     TARGET_COLUMN,
 )
@@ -27,32 +29,219 @@ from data import (
     build_labels,
     class_distribution,
     get_selectable_feature_columns,
+    get_target_candidates,
     load_raw_dataframe,
     prepare_dataset,
     resolve_data_path,
 )
 from models import list_algorithms
-from pipeline import RunConfig, config_to_dict, run_experiment
-from ui_controls import render_hyperparameters
+from param_presets import rank_rows
+from pipeline import RunConfig, config_to_dict, run_experiment, run_multi_preset_experiment
+from ui_controls import render_param_grid
 
 st.set_page_config(page_title="Salinity ML Lab", layout="wide", initial_sidebar_state="expanded")
 
 if "algo_params_store" not in st.session_state:
     st.session_state.algo_params_store = {}
 
+st.session_state.setdefault("target_columns", [TARGET_COLUMN])
+st.session_state.setdefault("label_mode", "threshold")
+st.session_state.setdefault("class_threshold", float(DEFAULT_SALINITY_THRESHOLD))
+st.session_state.setdefault("multi_target_combine", "any")
 
-def _save_algo_params(algorithm: str, params: dict) -> None:
-    st.session_state.algo_params_store[algorithm] = params
+grid_presets: list = []
 
 
-def _load_algo_params(algorithm: str) -> dict:
-    return st.session_state.algo_params_store.get(algorithm) or default_params(algorithm)
+def _metric_means(summary: dict) -> dict:
+    return {k: v for k, v in summary.items() if k.endswith("_mean")}
+
+
+def _best_heading(metric: str, score) -> str:
+    title = BEST_RESULT_TITLES.get(metric, "Best result")
+    if score is None:
+        return title
+    return f"{title}: {score:.3f}"
+
+
+def _cache_single_result(algorithm: str, name: str, params: dict, result) -> None:
+    st.session_state.last_results = {
+        "mode": "single",
+        "algorithm": algorithm,
+        "rows": [
+            {
+                "combo_name": name,
+                "params_summary": name,
+                **_metric_means(result.summary),
+            }
+        ],
+        "detail": {
+            "name": name,
+            "params": params,
+            "summary": result.summary,
+            "per_run": result.summary_dataframe().to_dict(orient="records"),
+            "feature_importance": result.feature_importance,
+            "class_balance": result.class_balance,
+            "features": result.feature_names,
+            "config": config_to_dict(result.config),
+        },
+    }
+
+
+def _cache_grid_results(algorithm: str, multi) -> None:
+    rows = []
+    details = []
+    for pname, pparams, pres in multi.preset_results:
+        rows.append(
+            {
+                "combo_name": pname,
+                "params_summary": pname,
+                **_metric_means(pres.summary),
+            }
+        )
+        details.append(
+            {
+                "name": pname,
+                "params": pparams,
+                "summary": pres.summary,
+                "per_run": pres.summary_dataframe().to_dict(orient="records"),
+                "feature_importance": pres.feature_importance,
+            }
+        )
+    st.session_state.last_results = {
+        "mode": "grid",
+        "algorithm": algorithm,
+        "rows": rows,
+        "details": details,
+    }
+
+
+def _cache_algo_compare(rows: list) -> None:
+    st.session_state.last_results = {
+        "mode": "algo_compare",
+        "algorithm": "all",
+        "rows": [
+            {
+                "combo_name": r["algorithm"],
+                "params_summary": r["algorithm"],
+                "recall_mean": r.get("recall_mean"),
+                "f1_mean": r.get("f1_mean"),
+                "balanced_accuracy_mean": r.get("balanced_accuracy_mean"),
+                "roc_auc_mean": r.get("roc_auc_mean"),
+            }
+            for r in rows
+        ],
+    }
+
+
+def _display_cached_results() -> None:
+    cached = st.session_state.get("last_results")
+    if not cached:
+        return
+
+    st.divider()
+    st.subheader("Results")
+    st.caption("Change the sort metric below.")
+
+    sort_metric = st.selectbox(
+        "Sort / pick best by",
+        options=list(RANK_METRICS.keys()),
+        format_func=lambda k: RANK_METRICS[k],
+        key="results_sort_metric",
+    )
+
+    rows = cached["rows"]
+    sorted_rows, best_name = rank_rows(rows, metric=sort_metric)
+    best_score = sorted_rows[0].get(sort_metric) if sorted_rows else None
+
+    st.markdown(f"### {_best_heading(sort_metric, best_score)}")
+    if best_name:
+        st.markdown(f"**Settings:** `{best_name}`")
+
+    table = pd.DataFrame(sorted_rows)
+    if "combo_name" in table.columns:
+        table = table.rename(columns={"combo_name": "configuration"})
+    st.dataframe(table, use_container_width=True)
+
+    mode = cached["mode"]
+    algo = cached.get("algorithm", "")
+
+    if mode == "grid" and best_name:
+        best_detail = next(
+            (d for d in cached["details"] if d["name"] == best_name),
+            cached["details"][0] if cached.get("details") else None,
+        )
+        if best_detail:
+            m1, m2, m3, m4, m5 = st.columns(5)
+            s = best_detail["summary"]
+            m1.metric("Recall", f"{s.get('recall_mean', 0):.3f}")
+            m2.metric("Precision", f"{s.get('precision_mean', 0):.3f}")
+            m3.metric("F1", f"{s.get('f1_mean', 0):.3f}")
+            m4.metric("Bal. accuracy", f"{s.get('balanced_accuracy_mean', 0):.3f}")
+            roc = s.get("roc_auc_mean")
+            m5.metric("ROC-AUC", f"{roc:.3f}" if roc is not None else "—")
+
+            with st.expander("All combinations — detailed results"):
+                for d in cached["details"]:
+                    st.markdown(f"#### {d['name']}")
+                    st.json(d["params"])
+                    st.dataframe(pd.DataFrame(d["per_run"]), use_container_width=True)
+
+            st.download_button(
+                "Download grid comparison (JSON)",
+                data=json.dumps(
+                    {
+                        "algorithm": algo,
+                        "sort_metric": sort_metric,
+                        "best_configuration": best_name,
+                        "comparison": sorted_rows,
+                        "details": cached["details"],
+                    },
+                    indent=2,
+                    default=str,
+                ),
+                file_name=f"{algo}_grid_comparison.json",
+                mime="application/json",
+                key="dl_grid_cached",
+            )
+
+    elif mode == "single" and cached.get("detail"):
+        d = cached["detail"]
+        s = d["summary"]
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Recall", f"{s.get('recall_mean', 0):.3f}")
+        m2.metric("Precision", f"{s.get('precision_mean', 0):.3f}")
+        m3.metric("F1", f"{s.get('f1_mean', 0):.3f}")
+        m4.metric("Bal. accuracy", f"{s.get('balanced_accuracy_mean', 0):.3f}")
+        roc = s.get("roc_auc_mean")
+        m5.metric("ROC-AUC", f"{roc:.3f}" if roc is not None else "—")
+
+        st.dataframe(pd.DataFrame([s]).T.rename(columns={0: "value"}), use_container_width=True)
+        st.dataframe(pd.DataFrame(d["per_run"]), use_container_width=True)
+
+        if d.get("feature_importance"):
+            imp_df = pd.DataFrame(
+                list(d["feature_importance"].items()),
+                columns=["feature", "importance"],
+            ).sort_values("importance", ascending=False)
+            st.bar_chart(imp_df.set_index("feature"))
+
+        st.download_button(
+            "Download full results (JSON)",
+            data=json.dumps(d, indent=2, default=str),
+            file_name="salinity_run.json",
+            mime="application/json",
+            key="dl_single_cached",
+        )
 
 
 st.title("Salinity classification lab")
 st.caption("Customize every algorithm, pick features, and tune training for small imbalanced datasets.")
 
 # ── Sidebar: data & run settings ──────────────────────────────────────────
+st.link_button(
+    "📂 GitHub Repository",
+    "https://github.com/Satoru-YUQG/Salinity"
+)
 with st.sidebar:
     st.header("Data")
     use_upload = st.checkbox("Upload Excel file", value=False)
@@ -71,14 +260,6 @@ with st.sidebar:
         except FileNotFoundError:
             default_path = ""
         data_path = st.text_input("Data file path", value=default_path)
-
-    salinity_threshold = st.slider(
-        "Ece threshold (≥ → saline class 1)",
-        0.0,
-        10.0,
-        float(DEFAULT_SALINITY_THRESHOLD),
-        0.05,
-    )
 
     st.header("Algorithm")
     algo_labels = list_algorithms()
@@ -141,7 +322,10 @@ tab_data, tab_features, tab_params, tab_run, tab_help = st.tabs(
 feature_mode = "exclude"
 drop_columns: list[str] = []
 use_columns: list[str] | None = None
-model_params = _load_algo_params(algorithm)
+target_columns: list[str] = list(st.session_state.target_columns)
+label_mode: str = st.session_state.label_mode
+class_threshold: float = float(st.session_state.class_threshold)
+multi_target_combine: str = st.session_state.multi_target_combine
 
 # ── Data tab ────────────────────────────────────────────────────────────────
 with tab_data:
@@ -153,7 +337,13 @@ with tab_data:
             st.dataframe(raw.head(25), use_container_width=True)
             st.write(f"**Rows:** {len(raw)} · **Columns:** {len(raw.columns)}")
 
-            y_preview = build_labels(raw, salinity_threshold)
+            y_preview = build_labels(
+                raw,
+                target_columns,
+                label_mode=label_mode,
+                class_threshold=class_threshold,
+                multi_target_combine=multi_target_combine,
+            )
             balance = class_distribution(y_preview.dropna())
             cols = st.columns(max(len(balance), 1))
             for idx, (label, info) in enumerate(balance.items()):
@@ -171,7 +361,68 @@ with tab_features:
         st.warning("Load data first.")
     else:
         raw = load_raw_dataframe(data_path)
-        selectable = get_selectable_feature_columns(raw)
+        target_options = get_target_candidates(raw)
+
+        st.subheader("Target Y (label)")
+        label_mode = st.radio(
+            "Label mode",
+            options=list(LABEL_MODES.keys()),
+            format_func=lambda k: LABEL_MODES[k],
+            horizontal=True,
+            key="label_mode_radio",
+        )
+        st.session_state.label_mode = label_mode
+
+        if label_mode == "threshold":
+            target_columns = st.multiselect(
+                "Target column(s) — numeric, compared to threshold",
+                options=target_options,
+                default=[c for c in st.session_state.target_columns if c in target_options]
+                or ([TARGET_COLUMN] if TARGET_COLUMN in target_options else target_options[:1]),
+                key="target_cols_threshold",
+            )
+            class_threshold = st.slider(
+                "Class threshold (value ≥ → class 1)",
+                0.0,
+                10.0,
+                float(st.session_state.class_threshold),
+                0.05,
+                key="class_threshold_slider",
+            )
+            multi_target_combine = st.radio(
+                "Multi-target rule",
+                options=list(MULTI_TARGET_COMBINE.keys()),
+                format_func=lambda k: MULTI_TARGET_COMBINE[k],
+                horizontal=True,
+                key="multi_target_combine_radio",
+                disabled=len(target_columns) <= 1,
+            )
+        else:
+            target_columns = st.selectbox(
+                "Target column — must be 0/1 or two unique values",
+                options=target_options,
+                index=target_options.index(st.session_state.target_columns[0])
+                if st.session_state.target_columns
+                and st.session_state.target_columns[0] in target_options
+                else 0,
+                key="target_col_direct",
+            )
+            target_columns = [target_columns]
+            class_threshold = float(st.session_state.class_threshold)
+            multi_target_combine = "any"
+
+        if not target_columns:
+            st.error("Select at least one target column.")
+            st.stop()
+
+        st.session_state.target_columns = target_columns
+        st.session_state.class_threshold = class_threshold
+        st.session_state.multi_target_combine = multi_target_combine
+
+        st.caption(f"**Target(s):** {', '.join(target_columns)}")
+
+        st.subheader("Feature columns (X)")
+        selectable = get_selectable_feature_columns(raw, target_columns=target_columns)
 
         feature_mode = st.radio(
             "Feature selection mode",
@@ -221,7 +472,10 @@ with tab_features:
         try:
             X, y, _ = prepare_dataset(
                 data_path,
-                salinity_threshold=salinity_threshold,
+                target_columns=target_columns,
+                label_mode=label_mode,
+                class_threshold=class_threshold,
+                multi_target_combine=multi_target_combine,
                 drop_columns=drop_columns if feature_mode == "exclude" else None,
                 use_columns=use_columns if feature_mode == "include" else None,
             )
@@ -235,29 +489,7 @@ with tab_params:
     if compare_all:
         st.info("Compare-all mode uses **default** hyperparameters for each algorithm.")
     else:
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Reset to defaults"):
-                st.session_state.algo_params_store.pop(algorithm, None)
-                st.rerun()
-        with c2:
-            uploaded_params = st.file_uploader(
-                "Load params JSON", type=["json"], key="params_upload"
-            )
-            if uploaded_params is not None:
-                loaded = json.loads(uploaded_params.getvalue())
-                st.session_state.algo_params_store[algorithm] = loaded
-                st.rerun()
-
-        model_params = render_hyperparameters(algorithm, key_prefix="hp_")
-        _save_algo_params(algorithm, model_params)
-
-        st.download_button(
-            "Save hyperparameters (JSON)",
-            data=json.dumps(model_params, indent=2),
-            file_name=f"{algorithm}_params.json",
-            mime="application/json",
-        )
+        grid_presets = render_param_grid(algorithm)
 
 # ── Run tab ─────────────────────────────────────────────────────────────────
 with tab_run:
@@ -272,22 +504,28 @@ with tab_run:
             st.error("Select at least one feature column.")
             st.stop()
 
+        if not compare_all and not grid_presets:
+            st.error("Fix hyperparameter grid values in the Hyperparameters tab.")
+            st.stop()
+
         seed = None if random_seed == 0 else int(random_seed)
         smote_k_neighbors = None if smote_k == 0 else int(smote_k)
         algorithms = list(algo_labels.keys()) if compare_all else [algorithm]
         comparison_rows = []
 
         for algo in algorithms:
-            params = default_params(algo) if compare_all else _load_algo_params(algo)
+            from algo_params import default_params
 
-            config = RunConfig(
+            base_config = RunConfig(
                 data_path=data_path,
-                salinity_threshold=salinity_threshold,
+                target_columns=target_columns,
+                label_mode=label_mode,
+                class_threshold=class_threshold,
+                multi_target_combine=multi_target_combine,
                 decision_threshold=decision_threshold,
                 drop_columns=drop_columns if feature_mode == "exclude" else [],
                 use_columns=use_columns if feature_mode == "include" else None,
                 algorithm=algo,
-                model_params=params,
                 sampling=sampling,
                 smote_k_neighbors=smote_k_neighbors,
                 normalize=normalize,
@@ -305,11 +543,37 @@ with tab_run:
 
             def on_progress(current, total, label=algo):
                 progress.progress(current / total)
-                status.text(f"{label}: {current}/{total}")
+                status.text(f"{label}: step {current} of {total}")
 
             try:
                 with st.spinner(f"Running {algo}…"):
-                    result = run_experiment(config, progress_callback=on_progress)
+                    if compare_all:
+                        from param_presets import ParamPreset
+                        presets = [ParamPreset(name="default", params=default_params(algo))]
+                        multi = run_multi_preset_experiment(base_config, presets, on_progress)
+                        row = {
+                            "algorithm": algo,
+                            "recall_mean": multi.preset_results[0][2].summary.get("recall_mean"),
+                            "f1_mean": multi.preset_results[0][2].summary.get("f1_mean"),
+                            "balanced_accuracy_mean": multi.preset_results[0][2].summary.get(
+                                "balanced_accuracy_mean"
+                            ),
+                            "roc_auc_mean": multi.preset_results[0][2].summary.get("roc_auc_mean"),
+                        }
+                        comparison_rows.append(row)
+                    elif len(grid_presets) == 1:
+                        cfg = base_config
+                        cfg.model_params = dict(grid_presets[0].params)
+                        cfg.preset_name = grid_presets[0].name
+                        result = run_experiment(cfg, progress_callback=on_progress)
+                        _cache_single_result(
+                            algo, grid_presets[0].name, grid_presets[0].params, result
+                        )
+                    else:
+                        multi = run_multi_preset_experiment(
+                            base_config, grid_presets, on_progress
+                        )
+                        _cache_grid_results(algo, multi)
             except Exception as exc:
                 st.error(f"{algo}: {exc}")
                 continue
@@ -317,78 +581,15 @@ with tab_run:
                 progress.empty()
                 status.empty()
 
-            if compare_all:
-                row = {
-                    "algorithm": algo,
-                    "recall_mean": result.summary.get("recall_mean"),
-                    "f1_mean": result.summary.get("f1_mean"),
-                    "balanced_accuracy_mean": result.summary.get("balanced_accuracy_mean"),
-                    "roc_auc_mean": result.summary.get("roc_auc_mean"),
-                }
-                comparison_rows.append(row)
-                continue
-
-            st.success(f"Finished — {algo}")
-
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Recall", f"{result.summary.get('recall_mean', 0):.3f}")
-            m2.metric("Precision", f"{result.summary.get('precision_mean', 0):.3f}")
-            m3.metric("F1", f"{result.summary.get('f1_mean', 0):.3f}")
-            m4.metric("Bal. accuracy", f"{result.summary.get('balanced_accuracy_mean', 0):.3f}")
-            m5.metric("ROC-AUC", f"{result.summary.get('roc_auc_mean', 0):.3f}" or "—")
-
-            if result.summary.get("tuned_threshold_mean") is not None:
-                st.write(
-                    f"Auto-tuned threshold: "
-                    f"{result.summary['tuned_threshold_mean']:.2f} "
-                    f"± {result.summary.get('tuned_threshold_std', 0):.2f}"
-                )
-
-            st.subheader("Summary")
-            st.dataframe(
-                pd.DataFrame([result.summary]).T.rename(columns={0: "value"}),
-                use_container_width=True,
-            )
-
-            st.subheader("Per-run / per-fold metrics")
-            st.dataframe(result.summary_dataframe(), use_container_width=True)
-
-            if result.feature_importance:
-                st.subheader("Feature importance (average)")
-                imp_df = (
-                    pd.DataFrame(
-                        list(result.feature_importance.items()),
-                        columns=["feature", "importance"],
-                    )
-                    .sort_values("importance", ascending=False)
-                )
-                st.bar_chart(imp_df.set_index("feature"))
-
-            st.download_button(
-                "Download full results (JSON)",
-                data=json.dumps(
-                    {
-                        "config": config_to_dict(config),
-                        "summary": result.summary,
-                        "class_balance": result.class_balance,
-                        "features": result.feature_names,
-                        "feature_importance": result.feature_importance,
-                    },
-                    indent=2,
-                    default=str,
-                ),
-                file_name="salinity_run.json",
-                mime="application/json",
-            )
-
         if compare_all and comparison_rows:
-            st.subheader("Comparison (by recall)")
-            st.dataframe(
-                pd.DataFrame(comparison_rows).sort_values(
-                    "recall_mean", ascending=False, na_position="last"
-                ),
-                use_container_width=True,
-            )
+            _cache_algo_compare(comparison_rows)
+            st.success(f"Finished — compared {len(comparison_rows)} algorithms")
+
+        elif st.session_state.get("last_results"):
+            n = len(st.session_state.last_results.get("rows", []))
+            st.success(f"Training complete — {n} configuration(s) cached.")
+
+    _display_cached_results()
 
 
 with tab_help:
@@ -410,7 +611,16 @@ Because the dataset can be **highly imbalanced** (very few saline samples), you 
 - Confirm the file loads and columns look correct.
 - Adjust the **Ece threshold** and watch how the **class balance** changes.
 
-### 2) Features tab (choose which columns are used)
+### 2) Features tab (target Y + feature columns)
+**Target Y**
+- Choose **one or more target columns** (default: `Ece mean`).
+- **Threshold mode**: numeric column(s); class 1 when value ≥ threshold.
+  - Multi-target: **ANY** (saline if any column meets rule) or **ALL** (all must meet rule).
+- **Direct mode**: one column already coded as 0/1 (or two unique values mapped to 0/1).
+
+Target columns are **automatically excluded** from features X (no leakage).
+
+**Feature columns X**
 You have two modes:
 - **Exclude mode**: use all allowed columns except the ones you drop.
 - **Include mode**: use **only** the selected columns (best when you want full control).
@@ -419,10 +629,13 @@ Notes:
 - ID columns and leakage columns (like `Ece mean`) are automatically blocked from training.
 - “Spectral only” is a fast way to avoid geographic memorization (longitude/latitude/year) and categorical soil/LU columns.
 
-### 3) Hyperparameters tab (full algorithm control)
-- Modify every hyperparameter exposed for the chosen algorithm.
-- **Save hyperparameters (JSON)** to create a reproducible “model preset”.
-- Load a saved JSON later (or share it with another researcher).
+### 3) Hyperparameters tab (grid search)
+- Enter **comma-separated values** in each field (e.g. trees: `300,200,150,50`, depth: `10,8,5`).
+- The app tests **every combination** automatically (4 × 3 = 12 configs).
+- Each combination runs for your chosen **Runs** × **CV folds** (if using stratified CV).
+- Results are ranked; change **Sort / pick best by** on the Run tab **without retraining**.
+- The heading updates automatically (e.g. **Best F1 score: 0.412**).
+- Save/load the grid as JSON.
 
 ### 4) Run tab (evaluation + export)
 Evaluation options:
