@@ -37,6 +37,7 @@ from data import (
 from models import list_algorithms
 from param_presets import rank_rows
 from pipeline import RunConfig, config_to_dict, run_experiment, run_multi_preset_experiment
+from result_figures import render_result_figures
 from ui_controls import render_param_grid
 
 st.set_page_config(page_title="Salinity ML Lab", layout="wide", initial_sidebar_state="expanded")
@@ -63,27 +64,26 @@ def _best_heading(metric: str, score) -> str:
     return f"{title}: {score:.3f}"
 
 
+def _detail_from_result(name: str, params: dict, result) -> dict:
+    return {
+        "name": name,
+        "params": params,
+        "summary": result.summary,
+        "per_run": result.summary_dataframe().to_dict(orient="records"),
+        "feature_importance": result.feature_importance,
+        "feature_names": result.feature_names,
+        "class_balance": result.class_balance,
+    }
+
+
 def _cache_single_result(algorithm: str, name: str, params: dict, result) -> None:
+    detail = _detail_from_result(name, params, result)
     st.session_state.last_results = {
         "mode": "single",
         "algorithm": algorithm,
-        "rows": [
-            {
-                "combo_name": name,
-                "params_summary": name,
-                **_metric_means(result.summary),
-            }
-        ],
-        "detail": {
-            "name": name,
-            "params": params,
-            "summary": result.summary,
-            "per_run": result.summary_dataframe().to_dict(orient="records"),
-            "feature_importance": result.feature_importance,
-            "class_balance": result.class_balance,
-            "features": result.feature_names,
-            "config": config_to_dict(result.config),
-        },
+        "rows": [{"combo_name": name, **_metric_means(result.summary)}],
+        "details": [detail],
+        "detail": detail,
     }
 
 
@@ -91,22 +91,8 @@ def _cache_grid_results(algorithm: str, multi) -> None:
     rows = []
     details = []
     for pname, pparams, pres in multi.preset_results:
-        rows.append(
-            {
-                "combo_name": pname,
-                "params_summary": pname,
-                **_metric_means(pres.summary),
-            }
-        )
-        details.append(
-            {
-                "name": pname,
-                "params": pparams,
-                "summary": pres.summary,
-                "per_run": pres.summary_dataframe().to_dict(orient="records"),
-                "feature_importance": pres.feature_importance,
-            }
-        )
+        rows.append({"combo_name": pname, **_metric_means(pres.summary)})
+        details.append(_detail_from_result(pname, pparams, pres))
     st.session_state.last_results = {
         "mode": "grid",
         "algorithm": algorithm,
@@ -122,7 +108,6 @@ def _cache_algo_compare(rows: list) -> None:
         "rows": [
             {
                 "combo_name": r["algorithm"],
-                "params_summary": r["algorithm"],
                 "recall_mean": r.get("recall_mean"),
                 "f1_mean": r.get("f1_mean"),
                 "balanced_accuracy_mean": r.get("balanced_accuracy_mean"),
@@ -133,6 +118,64 @@ def _cache_algo_compare(rows: list) -> None:
     }
 
 
+def _results_table(sorted_rows: list) -> pd.DataFrame:
+    table = pd.DataFrame(sorted_rows)
+    table = table.drop(columns=["params_summary"], errors="ignore")
+    if "combo_name" in table.columns:
+        table = table.rename(columns={"combo_name": "configuration"})
+    return table
+
+
+def _find_detail(cached: dict, config_name: str) -> dict | None:
+    for d in cached.get("details") or []:
+        if d["name"] == config_name:
+            return d
+    if cached.get("detail") and cached["detail"].get("name") == config_name:
+        return cached["detail"]
+    return None
+
+
+def _render_configuration_detail(detail: dict, show_figures: bool) -> None:
+    s = detail["summary"]
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Recall", f"{s.get('recall_mean', 0):.3f}")
+    m2.metric("Precision", f"{s.get('precision_mean', 0):.3f}")
+    m3.metric("F1", f"{s.get('f1_mean', 0):.3f}")
+    m4.metric("Bal. accuracy", f"{s.get('balanced_accuracy_mean', 0):.3f}")
+    roc = s.get("roc_auc_mean")
+    m5.metric("ROC-AUC", f"{roc:.3f}" if roc is not None else "—")
+
+    if s.get("tuned_threshold_mean") is not None:
+        st.caption(
+            f"Auto-tuned threshold: {s['tuned_threshold_mean']:.2f} "
+            f"± {s.get('tuned_threshold_std', 0):.2f}"
+        )
+
+    if show_figures:
+        st.subheader("Figures")
+        render_result_figures(detail, detail["name"])
+
+    st.subheader("Feature importance")
+    if detail.get("feature_importance"):
+        imp_df = (
+            pd.DataFrame(
+                list(detail["feature_importance"].items()),
+                columns=["feature", "importance"],
+            )
+            .sort_values("importance", ascending=False)
+        )
+        st.dataframe(imp_df, use_container_width=True, hide_index=True)
+        st.bar_chart(imp_df.set_index("feature"))
+    else:
+        st.info("Feature importance is not available for this algorithm.")
+
+    if detail.get("feature_names"):
+        st.caption(f"**Features used ({len(detail['feature_names'])}):** {', '.join(detail['feature_names'])}")
+
+    st.subheader("Per-run / per-fold metrics")
+    st.dataframe(pd.DataFrame(detail["per_run"]), use_container_width=True, hide_index=True)
+
+
 def _display_cached_results() -> None:
     cached = st.session_state.get("last_results")
     if not cached:
@@ -140,7 +183,7 @@ def _display_cached_results() -> None:
 
     st.divider()
     st.subheader("Results")
-    st.caption("Change the sort metric below.")
+    st.caption("Change the sort metric below — no retraining needed.")
 
     sort_metric = st.selectbox(
         "Sort / pick best by",
@@ -157,44 +200,57 @@ def _display_cached_results() -> None:
     if best_name:
         st.markdown(f"**Settings:** `{best_name}`")
 
-    table = pd.DataFrame(sorted_rows)
-    if "combo_name" in table.columns:
-        table = table.rename(columns={"combo_name": "configuration"})
-    st.dataframe(table, use_container_width=True)
+    display_table = _results_table(sorted_rows)
+    st.caption("Click a row in the table to inspect that configuration.")
 
+    table_response = st.dataframe(
+        display_table,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="results_grid_table",
+    )
+
+    selected_idx = 0
+    if table_response.selection and table_response.selection.rows:
+        selected_idx = table_response.selection.rows[0]
+
+    selected_name = display_table.iloc[selected_idx]["configuration"]
     mode = cached["mode"]
     algo = cached.get("algorithm", "")
 
-    if mode == "grid" and best_name:
-        best_detail = next(
-            (d for d in cached["details"] if d["name"] == best_name),
-            cached["details"][0] if cached.get("details") else None,
-        )
-        if best_detail:
-            m1, m2, m3, m4, m5 = st.columns(5)
-            s = best_detail["summary"]
-            m1.metric("Recall", f"{s.get('recall_mean', 0):.3f}")
-            m2.metric("Precision", f"{s.get('precision_mean', 0):.3f}")
-            m3.metric("F1", f"{s.get('f1_mean', 0):.3f}")
-            m4.metric("Bal. accuracy", f"{s.get('balanced_accuracy_mean', 0):.3f}")
-            roc = s.get("roc_auc_mean")
-            m5.metric("ROC-AUC", f"{roc:.3f}" if roc is not None else "—")
+    show_figures = st.checkbox("Show figures", value=False, key="show_result_figures")
 
-            with st.expander("All combinations — detailed results"):
-                for d in cached["details"]:
-                    st.markdown(f"#### {d['name']}")
-                    st.json(d["params"])
-                    st.dataframe(pd.DataFrame(d["per_run"]), use_container_width=True)
+    if mode in ("grid", "single"):
+        detail = _find_detail(cached, selected_name)
+        if detail is None and cached.get("details"):
+            detail = cached["details"][0]
+        elif detail is None:
+            detail = cached.get("detail")
+
+        if detail:
+            st.markdown(f"#### Selected: `{selected_name}`")
+            _render_configuration_detail(detail, show_figures)
 
             st.download_button(
-                "Download grid comparison (JSON)",
+                "Download selected configuration (JSON)",
+                data=json.dumps(detail, indent=2, default=str),
+                file_name="salinity_selected_run.json",
+                mime="application/json",
+                key="dl_selected",
+            )
+
+        if mode == "grid":
+            st.download_button(
+                "Download full grid comparison (JSON)",
                 data=json.dumps(
                     {
                         "algorithm": algo,
                         "sort_metric": sort_metric,
                         "best_configuration": best_name,
                         "comparison": sorted_rows,
-                        "details": cached["details"],
+                        "details": cached.get("details"),
                     },
                     indent=2,
                     default=str,
@@ -203,36 +259,6 @@ def _display_cached_results() -> None:
                 mime="application/json",
                 key="dl_grid_cached",
             )
-
-    elif mode == "single" and cached.get("detail"):
-        d = cached["detail"]
-        s = d["summary"]
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Recall", f"{s.get('recall_mean', 0):.3f}")
-        m2.metric("Precision", f"{s.get('precision_mean', 0):.3f}")
-        m3.metric("F1", f"{s.get('f1_mean', 0):.3f}")
-        m4.metric("Bal. accuracy", f"{s.get('balanced_accuracy_mean', 0):.3f}")
-        roc = s.get("roc_auc_mean")
-        m5.metric("ROC-AUC", f"{roc:.3f}" if roc is not None else "—")
-
-        st.dataframe(pd.DataFrame([s]).T.rename(columns={0: "value"}), use_container_width=True)
-        st.dataframe(pd.DataFrame(d["per_run"]), use_container_width=True)
-
-        if d.get("feature_importance"):
-            imp_df = pd.DataFrame(
-                list(d["feature_importance"].items()),
-                columns=["feature", "importance"],
-            ).sort_values("importance", ascending=False)
-            st.bar_chart(imp_df.set_index("feature"))
-
-        st.download_button(
-            "Download full results (JSON)",
-            data=json.dumps(d, indent=2, default=str),
-            file_name="salinity_run.json",
-            mime="application/json",
-            key="dl_single_cached",
-        )
-
 
 st.title("Salinity classification lab")
 st.caption("Customize every algorithm, pick features, and tune training for small imbalanced datasets.")

@@ -291,7 +291,6 @@ def run_multi_preset_experiment(
 
         row = {
             "combo_name": preset.name,
-            "params_summary": format_params_short(base_config.algorithm, preset.params),
             **{k: v for k, v in result.summary.items() if k.endswith("_mean")},
         }
         comparison_rows.append(row)
