@@ -65,7 +65,10 @@ py Salinity_2.py
 | **Features** | Drop columns *or* use only selected columns |
 | **Hyperparameters** | Full sklearn settings per algorithm (save/load JSON) |
 | **Run** | Results, feature importance chart, JSON export |
+| **History** | Browse saved runs, inspect past results, restore editable settings, or delete entries |
 
 **Sidebar:** resampling, SMOTE neighbors, hold-out vs stratified CV, auto-tune decision threshold for recall/F1.
+
+Completed UI runs are saved locally in `data/experiment_history.sqlite3` (the `data/` folder is excluded from version control). History stores the run settings and results, not a copy of the dataset; the original data file must still be available to rerun an experiment.
 
 Open this folder in Visual Studio and set **Working Directory** to `.` if you debug from the IDE.

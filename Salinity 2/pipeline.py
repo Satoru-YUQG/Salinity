@@ -79,10 +79,12 @@ class MultiPresetResult:
 
 
 def _aggregate_metrics(metrics: List[MetricBundle]) -> Dict[str, float]:
-    keys = ["accuracy", "balanced_accuracy", "recall", "precision", "f1"]
+    keys = ["accuracy", "balanced_accuracy", "recall", "precision", "f1", "train_f1"]
     out: Dict[str, float] = {}
     for key in keys:
-        values = [getattr(m, key) for m in metrics]
+        values = [getattr(m, key) for m in metrics if getattr(m, key) is not None]
+        if not values:
+            continue
         out[f"{key}_mean"] = float(np.mean(values))
         out[f"{key}_std"] = float(np.std(values))
     roc_values = [m.roc_auc for m in metrics if m.roc_auc is not None]
@@ -141,6 +143,10 @@ def _train_and_evaluate_fold(
         threshold, _ = find_best_threshold(y_val, proba, metric=config.tune_metric)
 
     metrics = evaluate_model(model, X_val_t, y_val, decision_threshold=threshold)
+    train_metrics = evaluate_model(
+        model, transform_for_model(model, X_train), y_train, decision_threshold=threshold
+    )
+    metrics.train_f1 = train_metrics.f1
     importance = _feature_importance(model, feature_names)
     return metrics, threshold, importance
 
@@ -291,7 +297,11 @@ def run_multi_preset_experiment(
 
         row = {
             "combo_name": preset.name,
-            **{k: v for k, v in result.summary.items() if k.endswith("_mean")},
+            **{
+                k: v
+                for k, v in result.summary.items()
+                if k.endswith("_mean") or k.endswith("_std")
+            },
         }
         comparison_rows.append(row)
 

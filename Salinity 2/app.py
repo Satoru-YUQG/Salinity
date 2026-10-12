@@ -34,6 +34,7 @@ from data import (
     prepare_dataset,
     resolve_data_path,
 )
+from history_store import delete_run, get_run, list_runs, save_run
 from models import list_algorithms
 from param_presets import rank_rows
 from pipeline import RunConfig, config_to_dict, run_experiment, run_multi_preset_experiment
@@ -53,8 +54,117 @@ st.session_state.setdefault("multi_target_combine", "any")
 grid_presets: list = []
 
 
+def _apply_history_settings(saved_config: dict) -> None:
+    config = saved_config["run_config"]
+    algorithm = config.get("algorithm", "random_forest")
+    targets = list(config.get("target_columns") or [TARGET_COLUMN])
+    use_columns = config.get("use_columns")
+    grid_text = saved_config.get("grid_text") or {}
+    state = st.session_state
+
+    state["use_upload"] = False
+    state["data_file_path"] = config.get("data_path") or ""
+    state["algorithm_select"] = algorithm
+    state["compare_all"] = saved_config.get("run_type") == "compare_all"
+    state["sampling_select"] = config.get("sampling", "smote")
+    state["smote_k_neighbors"] = config.get("smote_k_neighbors") or 0
+    state["normalize_features"] = config.get("normalize", True)
+    state["evaluation_mode"] = config.get("evaluation_mode", "holdout")
+    state["cv_folds"] = int(config.get("cv_folds", 5))
+    state["n_runs"] = int(config.get("n_runs", DEFAULT_RUNS))
+    state["test_size"] = float(config.get("test_size", DEFAULT_TEST_SIZE))
+    state["auto_tune_threshold"] = config.get("auto_tune_threshold", False)
+    state["tune_metric"] = config.get("tune_metric", "recall")
+    state["decision_threshold"] = float(
+        config.get("decision_threshold", DEFAULT_DECISION_THRESHOLD)
+    )
+    state["random_seed"] = config.get("random_seed") or 0
+
+    state["label_mode"] = config.get("label_mode", "threshold")
+    state["label_mode_radio"] = state["label_mode"]
+    state["target_columns"] = targets
+    state["target_cols_threshold"] = targets
+    state["target_col_direct"] = targets[0]
+    state["class_threshold"] = float(
+        config.get("class_threshold", DEFAULT_SALINITY_THRESHOLD)
+    )
+    state["class_threshold_slider"] = state["class_threshold"]
+    state["multi_target_combine"] = config.get("multi_target_combine", "any")
+    state["multi_target_combine_radio"] = state["multi_target_combine"]
+    state["feature_mode"] = "include" if use_columns is not None else "exclude"
+    state["feat_include"] = list(use_columns or [])
+    state["feat_drop"] = list(config.get("drop_columns") or [])
+
+    grid_store = dict(state.get("param_grid_store", {}))
+    grid_store[algorithm] = dict(grid_text)
+    state["param_grid_store"] = grid_store
+    for name, value in grid_text.items():
+        state[f"grid_{algorithm}_{name}"] = str(value)
+
+    state["history_notice"] = (
+        "Saved settings loaded. Review or edit them in the sidebar and tabs, then run the experiment."
+    )
+    state["history_view_id"] = None
+
+
+def _delete_history_record(run_id: int) -> None:
+    try:
+        delete_run(run_id)
+        st.session_state["history_notice"] = "Saved experiment deleted."
+    except Exception as exc:
+        st.session_state["history_notice"] = f"Could not delete saved experiment: {exc}"
+    st.session_state.pop("history_selected_id", None)
+
+
+def _save_history_record(
+    *, title: str, run_type: str, algorithm: str, config: dict, results: dict
+) -> int:
+    return save_run(
+        title=title,
+        run_type=run_type,
+        algorithm=algorithm,
+        config=config,
+        results=results,
+    )
+
+
+def _history_configuration(
+    config: RunConfig,
+    *,
+    run_type: str,
+    grid_text: dict,
+    algorithms: list[str],
+) -> dict:
+    return {
+        "run_config": config_to_dict(config),
+        "run_type": run_type,
+        "grid_text": dict(grid_text),
+        "algorithms": list(algorithms),
+    }
+
+
+def _persist_completed_run(
+    *, title: str, run_type: str, algorithm: str, config: dict, results: dict
+) -> None:
+    try:
+        run_id = _save_history_record(
+            title=title,
+            run_type=run_type,
+            algorithm=algorithm,
+            config=config,
+            results=results,
+        )
+        st.caption(f"Automatically saved to History as experiment {run_id}.")
+    except Exception as exc:
+        st.warning(f"The experiment completed, but could not be saved to History: {exc}")
+
+
 def _metric_means(summary: dict) -> dict:
-    return {k: v for k, v in summary.items() if k.endswith("_mean")}
+    return {
+        k: v
+        for k, v in summary.items()
+        if k.endswith("_mean") or k.endswith("_std")
+    }
 
 
 def _best_heading(metric: str, score) -> str:
@@ -109,9 +219,15 @@ def _cache_algo_compare(rows: list) -> None:
             {
                 "combo_name": r["algorithm"],
                 "recall_mean": r.get("recall_mean"),
+                "recall_std": r.get("recall_std"),
                 "f1_mean": r.get("f1_mean"),
+                "f1_std": r.get("f1_std"),
+                "train_f1_mean": r.get("train_f1_mean"),
+                "train_f1_std": r.get("train_f1_std"),
                 "balanced_accuracy_mean": r.get("balanced_accuracy_mean"),
+                "balanced_accuracy_std": r.get("balanced_accuracy_std"),
                 "roc_auc_mean": r.get("roc_auc_mean"),
+                "roc_auc_std": r.get("roc_auc_std"),
             }
             for r in rows
         ],
@@ -123,6 +239,22 @@ def _results_table(sorted_rows: list) -> pd.DataFrame:
     table = table.drop(columns=["params_summary"], errors="ignore")
     if "combo_name" in table.columns:
         table = table.rename(columns={"combo_name": "configuration"})
+    metric_labels = {
+        "accuracy": "Accuracy",
+        "balanced_accuracy": "Balanced accuracy",
+        "f1": "Validation F1",
+        "precision": "Precision",
+        "recall": "Recall",
+        "roc_auc": "ROC-AUC",
+        "train_f1": "Training F1",
+    }
+    table = table.rename(
+        columns={
+            f"{metric}_{stat}": f"{label} {stat}"
+            for metric, label in metric_labels.items()
+            for stat in ("mean", "std")
+        }
+    )
     return table
 
 
@@ -137,13 +269,24 @@ def _find_detail(cached: dict, config_name: str) -> dict | None:
 
 def _render_configuration_detail(detail: dict, show_figures: bool) -> None:
     s = detail["summary"]
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Recall", f"{s.get('recall_mean', 0):.3f}")
     m2.metric("Precision", f"{s.get('precision_mean', 0):.3f}")
-    m3.metric("F1", f"{s.get('f1_mean', 0):.3f}")
-    m4.metric("Bal. accuracy", f"{s.get('balanced_accuracy_mean', 0):.3f}")
+    m3.metric(
+        "Validation F1",
+        f"{s.get('f1_mean', 0):.3f}",
+        delta=f"± {s.get('f1_std', 0):.3f} SD",
+        delta_color="off",
+    )
+    m4.metric(
+        "Training F1",
+        f"{s.get('train_f1_mean', 0):.3f}",
+        delta=f"± {s.get('train_f1_std', 0):.3f} SD",
+        delta_color="off",
+    )
+    m5.metric("Bal. accuracy", f"{s.get('balanced_accuracy_mean', 0):.3f}")
     roc = s.get("roc_auc_mean")
-    m5.metric("ROC-AUC", f"{roc:.3f}" if roc is not None else "—")
+    m6.metric("ROC-AUC", f"{roc:.3f}" if roc is not None else "—")
 
     if s.get("tuned_threshold_mean") is not None:
         st.caption(
@@ -172,14 +315,50 @@ def _render_configuration_detail(detail: dict, show_figures: bool) -> None:
     if detail.get("feature_names"):
         st.caption(f"**Features used ({len(detail['feature_names'])}):** {', '.join(detail['feature_names'])}")
 
+    metric_labels = {
+        "accuracy": "Accuracy",
+        "balanced_accuracy": "Balanced accuracy",
+        "recall": "Recall",
+        "precision": "Precision",
+        "f1": "Validation F1",
+        "train_f1": "Training F1",
+        "roc_auc": "ROC-AUC",
+    }
+    summary_rows = [
+        {
+            "Metric": label,
+            "Mean": s.get(f"{metric}_mean"),
+            "Standard deviation": s.get(f"{metric}_std"),
+        }
+        for metric, label in metric_labels.items()
+        if s.get(f"{metric}_mean") is not None
+    ]
+    st.subheader("Summary across runs / folds")
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
     st.subheader("Per-run / per-fold metrics")
-    st.dataframe(pd.DataFrame(detail["per_run"]), use_container_width=True, hide_index=True)
+    per_run = pd.DataFrame(detail["per_run"]).rename(
+        columns={
+            "accuracy": "Accuracy",
+            "balanced_accuracy": "Balanced accuracy",
+            "recall": "Recall",
+            "precision": "Precision",
+            "f1": "Validation F1",
+            "train_f1": "Training F1",
+            "roc_auc": "ROC-AUC",
+            "confusion_matrix": "Validation confusion matrix",
+        }
+    )
+    st.dataframe(per_run, use_container_width=True, hide_index=True)
 
 
-def _display_cached_results() -> None:
-    cached = st.session_state.get("last_results")
+def _display_cached_results(cached: dict | None = None, *, view_id: str = "current") -> None:
+    if cached is None:
+        cached = st.session_state.get("last_results")
     if not cached:
         return
+
+    key_suffix = "" if view_id == "current" else f"_{view_id}"
 
     st.divider()
     st.subheader("Results")
@@ -189,7 +368,7 @@ def _display_cached_results() -> None:
         "Sort / pick best by",
         options=list(RANK_METRICS.keys()),
         format_func=lambda k: RANK_METRICS[k],
-        key="results_sort_metric",
+        key=f"results_sort_metric{key_suffix}",
     )
 
     rows = cached["rows"]
@@ -209,7 +388,7 @@ def _display_cached_results() -> None:
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        key="results_grid_table",
+        key=f"results_grid_table{key_suffix}",
     )
 
     selected_idx = 0
@@ -220,7 +399,9 @@ def _display_cached_results() -> None:
     mode = cached["mode"]
     algo = cached.get("algorithm", "")
 
-    show_figures = st.checkbox("Show figures", value=False, key="show_result_figures")
+    show_figures = st.checkbox(
+        "Show figures", value=False, key=f"show_result_figures{key_suffix}"
+    )
 
     if mode in ("grid", "single"):
         detail = _find_detail(cached, selected_name)
@@ -238,7 +419,7 @@ def _display_cached_results() -> None:
                 data=json.dumps(detail, indent=2, default=str),
                 file_name="salinity_selected_run.json",
                 mime="application/json",
-                key="dl_selected",
+                key=f"dl_selected{key_suffix}",
             )
 
         if mode == "grid":
@@ -257,7 +438,111 @@ def _display_cached_results() -> None:
                 ),
                 file_name=f"{algo}_grid_comparison.json",
                 mime="application/json",
-                key="dl_grid_cached",
+                key=f"dl_grid_cached{key_suffix}",
+            )
+
+
+def _render_history_page() -> None:
+    st.header("Experiment history")
+    st.caption("Completed experiments are saved locally and remain available after restarting the app.")
+
+    notice = st.session_state.pop("history_notice", None)
+    if notice:
+        st.info(notice)
+
+    try:
+        records = list_runs()
+    except Exception as exc:
+        st.error(f"Could not read experiment history: {exc}")
+        return
+
+    if not records:
+        st.info("No saved experiments yet. Completed runs will appear here automatically.")
+        return
+
+    def _best_value(summary_rows: list[dict], field: str):
+        values = [row.get(field) for row in summary_rows if row.get(field) is not None]
+        return max(values) if values else None
+
+    history_rows = []
+    record_by_id = {record["id"]: record for record in records}
+    for record in records:
+        summary_rows = record["summary"]
+        history_rows.append(
+            {
+                "Date": record["created_at"].replace("T", " "),
+                "Experiment": record["title"],
+                "Type": record["run_type"].replace("_", " ").title(),
+                "Algorithm": record["algorithm"],
+                "Configurations": len(summary_rows),
+                "Best validation F1": _best_value(summary_rows, "f1_mean"),
+                "Best training F1": _best_value(summary_rows, "train_f1_mean"),
+            }
+        )
+    st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
+
+    record_ids = list(record_by_id)
+    selected_id = st.selectbox(
+        "Select an experiment",
+        options=record_ids,
+        format_func=lambda run_id: (
+            f"{record_by_id[run_id]['created_at'].replace('T', ' ')} · "
+            f"{record_by_id[run_id]['title']}"
+        ),
+        key="history_selected_id",
+    )
+    selected = record_by_id[selected_id]
+    saved_config = selected["config"]
+    run_config = saved_config.get("run_config", {})
+
+    st.markdown(f"#### {selected['title']}")
+    st.caption(
+        f"{selected['created_at'].replace('T', ' ')} · "
+        f"{run_config.get('evaluation_mode', 'unknown')} · "
+        f"{run_config.get('n_runs', 0)} run(s)"
+    )
+    data_path = run_config.get("data_path")
+    if data_path:
+        if Path(data_path).exists():
+            st.caption(f"Data file: `{data_path}`")
+        else:
+            st.warning(f"The original data file is not currently available: {data_path}")
+
+    load_col, view_col, delete_col = st.columns([1, 1, 1])
+    with load_col:
+        st.button(
+            "Load settings into Run",
+            key=f"history_load_{selected_id}",
+            on_click=_apply_history_settings,
+            args=(saved_config,),
+            use_container_width=True,
+        )
+    with view_col:
+        if st.button(
+            "View saved results",
+            key=f"history_view_{selected_id}",
+            use_container_width=True,
+        ):
+            st.session_state["history_view_id"] = selected_id
+    with delete_col:
+        confirmed = st.checkbox(
+            "Confirm deletion",
+            key=f"history_confirm_delete_{selected_id}",
+        )
+        st.button(
+            "Delete experiment",
+            key=f"history_delete_{selected_id}",
+            on_click=_delete_history_record,
+            args=(selected_id,),
+            disabled=not confirmed,
+            use_container_width=True,
+        )
+
+    if st.session_state.get("history_view_id") == selected_id:
+        saved_run = get_run(selected_id)
+        if saved_run:
+            _display_cached_results(
+                saved_run["results"], view_id=f"history_{selected_id}"
             )
 
 st.title("Salinity classification lab")
@@ -270,7 +555,7 @@ st.link_button(
 )
 with st.sidebar:
     st.header("Data")
-    use_upload = st.checkbox("Upload Excel file", value=False)
+    use_upload = st.checkbox("Upload Excel file", value=False, key="use_upload")
     data_path = None
 
     if use_upload:
@@ -285,7 +570,7 @@ with st.sidebar:
             default_path = str(resolve_data_path())
         except FileNotFoundError:
             default_path = ""
-        data_path = st.text_input("Data file path", value=default_path)
+        data_path = st.text_input("Data file path", value=default_path, key="data_file_path")
 
     st.header("Algorithm")
     algo_labels = list_algorithms()
@@ -293,14 +578,16 @@ with st.sidebar:
         "Model",
         options=list(algo_labels.keys()),
         format_func=lambda k: algo_labels[k],
+        key="algorithm_select",
     )
-    compare_all = st.checkbox("Compare all algorithms", value=False)
+    compare_all = st.checkbox("Compare all algorithms", value=False, key="compare_all")
 
     st.header("Training")
     sampling = st.selectbox(
         "Resampling",
         options=list(SAMPLING_CHOICES.keys()),
         format_func=lambda k: SAMPLING_CHOICES[k],
+        key="sampling_select",
     )
     smote_k = st.number_input(
         "SMOTE / ADASYN neighbors (0 = auto)",
@@ -308,8 +595,9 @@ with st.sidebar:
         max_value=10,
         value=0,
         help="Auto uses min(5, minority_count - 1).",
+        key="smote_k_neighbors",
     )
-    normalize = st.checkbox("Standardize features", value=True)
+    normalize = st.checkbox("Standardize features", value=True, key="normalize_features")
 
     evaluation_mode = st.selectbox(
         "Evaluation",
@@ -318,18 +606,24 @@ with st.sidebar:
             "holdout": "Repeated random hold-out",
             "stratified_cv": "Stratified k-fold (per run)",
         }[x],
+        key="evaluation_mode",
     )
-    cv_folds = st.slider("CV folds", 2, 10, 5)
-    n_runs = st.number_input("Runs", 1, 200, DEFAULT_RUNS)
-    test_size = st.slider("Hold-out validation %", 0.1, 0.4, float(DEFAULT_TEST_SIZE), 0.05)
+    cv_folds = st.slider("CV folds", 2, 10, 5, key="cv_folds")
+    n_runs = st.number_input("Runs", 1, 200, DEFAULT_RUNS, key="n_runs")
+    test_size = st.slider(
+        "Hold-out validation %", 0.1, 0.4, float(DEFAULT_TEST_SIZE), 0.05, key="test_size"
+    )
 
     st.subheader("Decision threshold")
     auto_tune_threshold = st.checkbox(
         "Auto-tune on validation set",
         value=False,
         help="Scans probability thresholds each fold to maximize recall or F1.",
+        key="auto_tune_threshold",
     )
-    tune_metric = st.selectbox("Optimize metric", ["recall", "f1"], disabled=not auto_tune_threshold)
+    tune_metric = st.selectbox(
+        "Optimize metric", ["recall", "f1"], disabled=not auto_tune_threshold, key="tune_metric"
+    )
     decision_threshold = st.slider(
         "Fixed P(saline) threshold",
         0.05,
@@ -337,12 +631,15 @@ with st.sidebar:
         float(DEFAULT_DECISION_THRESHOLD),
         0.05,
         disabled=auto_tune_threshold,
+        key="decision_threshold",
     )
 
-    random_seed = st.number_input("Random seed (0 = random each run)", 0, 10_000, 0)
+    random_seed = st.number_input(
+        "Random seed (0 = random each run)", 0, 10_000, 0, key="random_seed"
+    )
 
-tab_data, tab_features, tab_params, tab_run, tab_help = st.tabs(
-    ["Data", "Features", "Hyperparameters", "Run", "Guide"]
+tab_data, tab_features, tab_params, tab_run, tab_history, tab_help = st.tabs(
+    ["Data", "Features", "Hyperparameters", "Run", "History", "Guide"]
 )
 
 feature_mode = "exclude"
@@ -459,6 +756,7 @@ with tab_features:
                 else "Use only the columns I select"
             ),
             horizontal=True,
+            key="feature_mode",
         )
 
         default_exclude = [c for c in ["Longitude", "Latitude", "Year"] if c in selectable]
@@ -537,6 +835,9 @@ with tab_run:
         seed = None if random_seed == 0 else int(random_seed)
         smote_k_neighbors = None if smote_k == 0 else int(smote_k)
         algorithms = list(algo_labels.keys()) if compare_all else [algorithm]
+        history_grid_text = dict(
+            st.session_state.get("param_grid_store", {}).get(algorithm, {})
+        )
         comparison_rows = []
 
         for algo in algorithms:
@@ -580,11 +881,23 @@ with tab_run:
                         row = {
                             "algorithm": algo,
                             "recall_mean": multi.preset_results[0][2].summary.get("recall_mean"),
+                            "recall_std": multi.preset_results[0][2].summary.get("recall_std"),
                             "f1_mean": multi.preset_results[0][2].summary.get("f1_mean"),
+                            "f1_std": multi.preset_results[0][2].summary.get("f1_std"),
+                            "train_f1_mean": multi.preset_results[0][2].summary.get(
+                                "train_f1_mean"
+                            ),
+                            "train_f1_std": multi.preset_results[0][2].summary.get(
+                                "train_f1_std"
+                            ),
                             "balanced_accuracy_mean": multi.preset_results[0][2].summary.get(
                                 "balanced_accuracy_mean"
                             ),
+                            "balanced_accuracy_std": multi.preset_results[0][2].summary.get(
+                                "balanced_accuracy_std"
+                            ),
                             "roc_auc_mean": multi.preset_results[0][2].summary.get("roc_auc_mean"),
+                            "roc_auc_std": multi.preset_results[0][2].summary.get("roc_auc_std"),
                         }
                         comparison_rows.append(row)
                     elif len(grid_presets) == 1:
@@ -595,11 +908,37 @@ with tab_run:
                         _cache_single_result(
                             algo, grid_presets[0].name, grid_presets[0].params, result
                         )
+                        history_config = _history_configuration(
+                            cfg,
+                            run_type="single",
+                            grid_text=history_grid_text,
+                            algorithms=[algo],
+                        )
+                        _persist_completed_run(
+                            title=f"{algo} · {evaluation_mode} · {n_runs} run(s)",
+                            run_type="single",
+                            algorithm=algo,
+                            config=history_config,
+                            results=st.session_state.last_results,
+                        )
                     else:
                         multi = run_multi_preset_experiment(
                             base_config, grid_presets, on_progress
                         )
                         _cache_grid_results(algo, multi)
+                        history_config = _history_configuration(
+                            base_config,
+                            run_type="grid",
+                            grid_text=history_grid_text,
+                            algorithms=[algo],
+                        )
+                        _persist_completed_run(
+                            title=f"{algo} · {len(grid_presets)} configurations · {evaluation_mode}",
+                            run_type="grid",
+                            algorithm=algo,
+                            config=history_config,
+                            results=st.session_state.last_results,
+                        )
             except Exception as exc:
                 st.error(f"{algo}: {exc}")
                 continue
@@ -610,12 +949,29 @@ with tab_run:
         if compare_all and comparison_rows:
             _cache_algo_compare(comparison_rows)
             st.success(f"Finished — compared {len(comparison_rows)} algorithms")
+            history_config = _history_configuration(
+                base_config,
+                run_type="compare_all",
+                grid_text=history_grid_text,
+                algorithms=algorithms,
+            )
+            _persist_completed_run(
+                title=f"All algorithms · {evaluation_mode} · {base_config.n_runs} run(s)",
+                run_type="compare_all",
+                algorithm="all",
+                config=history_config,
+                results=st.session_state.last_results,
+            )
 
         elif st.session_state.get("last_results"):
             n = len(st.session_state.last_results.get("rows", []))
             st.success(f"Training complete — {n} configuration(s) cached.")
 
     _display_cached_results()
+
+
+with tab_history:
+    _render_history_page()
 
 
 with tab_help:

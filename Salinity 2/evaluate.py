@@ -24,6 +24,7 @@ class MetricBundle:
     f1: float
     roc_auc: Optional[float]
     confusion: np.ndarray
+    train_f1: Optional[float] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -34,6 +35,7 @@ class MetricBundle:
             "f1": self.f1,
             "roc_auc": self.roc_auc,
             "confusion_matrix": self.confusion.tolist(),
+            "train_f1": self.train_f1,
         }
 
 

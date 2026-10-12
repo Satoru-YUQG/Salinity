@@ -106,6 +106,8 @@ Decision threshold options:
 - **Fixed threshold**: predicts saline when \(P(saline)\ge\) threshold (default 0.5).
 - **Auto-tune threshold**: searches probability cutoffs on each validation fold to maximize **recall** or **F1**.
 
+Result tables report mean and standard deviation across runs or folds. The detail view shows an aggregate summary table above the individual per-run/per-fold metrics. The individual table labels **Training F1** and **Validation F1** separately; both are calculated from their respective confusion matrices. Training F1 is measured on the original training samples used to fit the model, so it is an in-sample diagnostic and not an independent performance estimate. Validation F1 is measured on the held-out fold. When automatic threshold tuning is enabled, the current pipeline selects the threshold using that fold's validation labels and scores F1 on those same labels, so that validation F1 can be optimistic and should not be treated as an independent estimate.
+
 Exports:
 - Download a JSON containing the full config, summary metrics, selected features, and feature importance (when available).
 
